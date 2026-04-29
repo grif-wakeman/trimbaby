@@ -250,6 +250,49 @@
   .row-detail.show { display: block; }
   .row-detail.warn { color: var(--warn); }
 
+  /* Transcript button — text label, matches row-state typography */
+  .row-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .transcript-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    font-family: inherit;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--dimmer);
+    cursor: default;
+    display: none;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+    line-height: 1;
+  }
+  .transcript-btn.show { display: inline-block; }
+  .transcript-btn.loading {
+    color: var(--dim);
+    animation: tb-pulse 1.4s ease-in-out infinite;
+  }
+  .transcript-btn.ready {
+    color: var(--accent);
+    cursor: pointer;
+    font-weight: 700;
+  }
+  .transcript-btn.ready:hover { color: var(--ink); }
+  .transcript-btn.copied {
+    color: var(--ok);
+    font-weight: 700;
+    animation: none;
+  }
+  .transcript-btn.err { color: var(--warn); }
+  @keyframes tb-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+  }
+
   .summary {
     padding: 0.4rem 0.75rem;
     font-size: 0.7rem;
@@ -381,7 +424,8 @@
     <span>© Sync Beast LLC ·</span>
     <button class="info info-footer-word" type="button" id="privacyInfo" aria-label="Privacy" aria-expanded="false">privacy<span class="info-panel info-panel-footer" role="tooltip">
       <div class="privacy-head">Your audio stays on your device.</div>
-      <p>TRIMbaby processes files entirely inside your browser. Nothing is uploaded, stored, transmitted, or retained by us. No servers, no analytics, no third parties. When you close the tab, everything is gone.</p>
+      <p>TRIMbaby processes and transcribes files entirely inside your browser. Audio is never uploaded, stored, transmitted, or retained by us. No servers, no analytics, no third parties. When you close the tab, everything is gone.</p>
+      <p>The transcription model loads once from a public CDN, then is cached in your browser. Your audio is never sent anywhere.</p>
       <p>You retain all rights to your audio. We never listen to it, learn from it, or share it.</p>
     </span></button>
   </footer>
@@ -528,7 +572,10 @@ function enqueue(file) {
   row.className = 'row';
   row.innerHTML = `
     <div class="row-name"></div>
-    <div class="row-state">queued</div>
+    <div class="row-right">
+      <button class="transcript-btn" type="button" aria-label="Transcript"></button>
+      <div class="row-state">queued</div>
+    </div>
     <div class="row-bar"><div class="row-bar-fill"></div></div>
     <div class="row-detail"></div>
   `;
@@ -543,7 +590,13 @@ function enqueue(file) {
     barFillEl: row.querySelector('.row-bar-fill'),
     stateEl: row.querySelector('.row-state'),
     detailEl: row.querySelector('.row-detail'),
+    transcriptBtn: row.querySelector('.transcript-btn'),
+    transcriptIconLoading: row.querySelector('.tb-icon-loading'),
+    transcriptIconReady: row.querySelector('.tb-icon-ready'),
     status: 'pending',
+    transcript: null,
+    transcriptStatus: 'pending', // pending | loading | ready | err
+    decodedAudio: null, // cached for transcription pass
   });
 }
 
@@ -598,6 +651,7 @@ async function processItem(item) {
       throw new Error('Could not decode this file.');
     }
     audioCtx.close();
+    item.decodedAudio = audio; // cache for transcription
     item.barFillEl.style.width = '10%';
 
     // --- Trim silences ---
@@ -641,6 +695,9 @@ async function processItem(item) {
     }
     item.detailEl.textContent = detail;
     item.detailEl.classList.add('show');
+
+    // Kick off transcription in background — does not block next item
+    startTranscription(item);
   } catch (err) {
     console.error(err);
     item.status = 'err';
@@ -655,6 +712,287 @@ function trimmedName(name) {
   const dot = name.lastIndexOf('.');
   const base = dot > 0 ? name.slice(0, dot) : name;
   return base + '_trim.mp3';
+}
+
+// ============================================================
+// Transcription — Whisper-base.en via Transformers.js, in a Worker.
+// Runs after MP3 completes, in parallel with the next file's TRIM pass.
+// Audio never leaves the browser. First load downloads ~140MB of model
+// shards, cached forever after.
+// ============================================================
+
+const transcribeQueue = [];
+let transcribeWorker = null;
+let transcribeBusy = false;
+let transcribeModelLoaded = false;
+let transcribeModelLoadStarted = false;
+
+function ensureWorker() {
+  if (transcribeWorker) return transcribeWorker;
+  // Worker code as a blob so this stays a single-file app
+  const workerCode = `
+    let pipelinePromise = null;
+    let transcriber = null;
+
+    async function loadPipeline() {
+      if (transcriber) return transcriber;
+      if (pipelinePromise) return pipelinePromise;
+      pipelinePromise = (async () => {
+        const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+        const t = await pipeline(
+          'automatic-speech-recognition',
+          'Xenova/whisper-base.en',
+          {
+            progress_callback: (p) => {
+              if (p.status === 'progress' || p.status === 'download' || p.status === 'ready' || p.status === 'initiate') {
+                self.postMessage({ type: 'model-progress', payload: p });
+              }
+            }
+          }
+        );
+        transcriber = t;
+        self.postMessage({ type: 'model-ready' });
+        return t;
+      })();
+      return pipelinePromise;
+    }
+
+    self.addEventListener('message', async (e) => {
+      const { type, id, audio, sampleRate } = e.data;
+      if (type === 'preload') {
+        try { await loadPipeline(); } catch (err) { self.postMessage({ type: 'model-err', error: String(err) }); }
+        return;
+      }
+      if (type === 'transcribe') {
+        try {
+          self.postMessage({ type: 'transcribe-start', id, samples: audio.length, sr: sampleRate });
+          const t = await loadPipeline();
+          // Whisper's native window is 30s. For files <= 30s, no chunking needed.
+          // For longer files, use chunked decoding with stride for accuracy.
+          const durationS = audio.length / sampleRate;
+          const opts = { language: 'english', task: 'transcribe', return_timestamps: false };
+          if (durationS > 30) {
+            opts.chunk_length_s = 30;
+            opts.stride_length_s = 5;
+          }
+          self.postMessage({ type: 'transcribe-progress', id, stage: 'running', durationS });
+          const out = await t(audio, opts);
+          const text = (out && out.text ? out.text : '').trim();
+          self.postMessage({ type: 'transcribe-done', id, text });
+        } catch (err) {
+          self.postMessage({ type: 'transcribe-err', id, error: String(err && err.stack ? err.stack : err) });
+        }
+      }
+    });
+  `;
+  const blob = new Blob([workerCode], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  transcribeWorker = new Worker(url, { type: 'module' });
+
+  transcribeWorker.addEventListener('message', (e) => {
+    const msg = e.data;
+    if (msg.type === 'model-progress') {
+      // Soft status update on first load only
+      if (!transcribeModelLoaded) {
+        const p = msg.payload;
+        if (p.status === 'progress' && typeof p.progress === 'number') {
+          setStatus(`Loading transcription model · ${p.progress.toFixed(0)}%`);
+        } else if (p.status === 'initiate' || p.status === 'download') {
+          setStatus('Loading transcription model…');
+        }
+      }
+    } else if (msg.type === 'model-ready') {
+      transcribeModelLoaded = true;
+      setStatus('');
+    } else if (msg.type === 'model-err') {
+      // Mark all queued items as transcript-failed; don't kill the rest of the app
+      console.error('Whisper model load failed:', msg.error);
+      transcribeQueue.forEach(it => markTranscriptError(it));
+      transcribeQueue.length = 0;
+      transcribeBusy = false;
+      setStatus('');
+    } else if (msg.type === 'transcribe-start') {
+      console.log(`[transcribe] started id=${msg.id} samples=${msg.samples} sr=${msg.sr}`);
+    } else if (msg.type === 'transcribe-progress') {
+      console.log(`[transcribe] progress id=${msg.id} stage=${msg.stage} durationS=${msg.durationS}`);
+    } else if (msg.type === 'transcribe-done') {
+      const item = state.items.find(i => i.id === msg.id);
+      if (item) {
+        if (item._transcribeTimeout) { clearTimeout(item._transcribeTimeout); item._transcribeTimeout = null; }
+        item.transcript = msg.text || '';
+        item.transcriptStatus = 'ready';
+        updateTranscriptIcon(item);
+      }
+      transcribeBusy = false;
+      pumpTranscribe();
+    } else if (msg.type === 'transcribe-err') {
+      console.error('Transcribe error:', msg.error);
+      const item = state.items.find(i => i.id === msg.id);
+      if (item) {
+        if (item._transcribeTimeout) { clearTimeout(item._transcribeTimeout); item._transcribeTimeout = null; }
+        markTranscriptError(item);
+      }
+      transcribeBusy = false;
+      pumpTranscribe();
+    }
+  });
+
+  return transcribeWorker;
+}
+
+function markTranscriptError(item) {
+  item.transcriptStatus = 'err';
+  if (item.transcriptBtn) {
+    item.transcriptBtn.classList.remove('loading', 'ready', 'copied');
+    item.transcriptBtn.classList.add('err');
+    item.transcriptBtn.title = 'Transcription failed';
+  }
+}
+
+function updateTranscriptIcon(item) {
+  const btn = item.transcriptBtn;
+  if (!btn) return;
+  btn.classList.remove('loading', 'ready', 'copied', 'err');
+  if (item.transcriptStatus === 'loading') {
+    btn.classList.add('show', 'loading');
+    btn.textContent = 'transcribing…';
+    btn.title = '';
+  } else if (item.transcriptStatus === 'ready') {
+    btn.classList.add('show', 'ready');
+    btn.textContent = 'copy transcript';
+    btn.title = 'Click to copy transcript to clipboard';
+  } else if (item.transcriptStatus === 'err') {
+    btn.classList.add('show', 'err');
+    btn.textContent = 'transcript failed';
+    btn.title = 'Transcription failed — see console';
+  }
+}
+
+function startTranscription(item) {
+  ensureWorker();
+  // Kick off model preload on first call (no audio, just warms the pipeline)
+  if (!transcribeModelLoadStarted) {
+    transcribeModelLoadStarted = true;
+    transcribeWorker.postMessage({ type: 'preload' });
+  }
+
+  item.transcriptStatus = 'loading';
+  updateTranscriptIcon(item);
+
+  // Click handler — copies transcript when ready
+  if (!item._transcriptHandlerWired) {
+    item._transcriptHandlerWired = true;
+    item.transcriptBtn.addEventListener('click', async () => {
+      if (item.transcriptStatus !== 'ready' || !item.transcript) return;
+      const restoreText = 'copy transcript';
+      const flashCopied = () => {
+        item.transcriptBtn.classList.add('copied');
+        item.transcriptBtn.textContent = 'copied';
+        setTimeout(() => {
+          item.transcriptBtn.classList.remove('copied');
+          item.transcriptBtn.textContent = restoreText;
+        }, 1100);
+      };
+      try {
+        await navigator.clipboard.writeText(item.transcript);
+        flashCopied();
+      } catch (err) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = item.transcript;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          flashCopied();
+        } catch (e2) {
+          console.error('Clipboard write failed:', e2);
+        }
+      }
+    });
+  }
+
+  transcribeQueue.push(item);
+  pumpTranscribe();
+}
+
+async function pumpTranscribe() {
+  if (transcribeBusy) return;
+  const item = transcribeQueue.shift();
+  if (!item) return;
+  if (!item.decodedAudio) {
+    markTranscriptError(item);
+    pumpTranscribe();
+    return;
+  }
+  transcribeBusy = true;
+
+  try {
+    const mono16k = await prepareForWhisper(item.decodedAudio);
+    const durationS = mono16k.length / 16000;
+    item.decodedAudio = null;
+
+    // Generous timeout: base.en should do 1s of audio in roughly 0.3-1s on
+    // typical hardware, so 5x realtime + 60s headroom is comfortable.
+    const timeoutMs = Math.max(60000, durationS * 5000 + 60000);
+    item._transcribeTimeout = setTimeout(() => {
+      console.warn(`[transcribe] timeout after ${timeoutMs}ms for id=${item.id}`);
+      markTranscriptError(item);
+      transcribeBusy = false;
+      pumpTranscribe();
+    }, timeoutMs);
+
+    transcribeWorker.postMessage(
+      { type: 'transcribe', id: item.id, audio: mono16k, sampleRate: 16000 },
+      [mono16k.buffer]
+    );
+  } catch (err) {
+    console.error('Pre-Whisper resample failed:', err);
+    markTranscriptError(item);
+    transcribeBusy = false;
+    pumpTranscribe();
+  }
+}
+
+function transbufClear(item) {
+  // Hook for future cleanup; currently a no-op
+}
+
+async function prepareForWhisper(audioBuffer) {
+  const targetSr = 16000;
+  const nCh = audioBuffer.numberOfChannels;
+  const nFrames = audioBuffer.length;
+  const srcSr = audioBuffer.sampleRate;
+
+  // Mix to mono
+  const mono = new Float32Array(nFrames);
+  for (let c = 0; c < nCh; c++) {
+    const ch = audioBuffer.getChannelData(c);
+    for (let i = 0; i < nFrames; i++) mono[i] += ch[i];
+  }
+  if (nCh > 1) {
+    const inv = 1 / nCh;
+    for (let i = 0; i < nFrames; i++) mono[i] *= inv;
+  }
+
+  if (srcSr === targetSr) return mono;
+
+  // Linear-interp resample (good enough for Whisper input)
+  const ratio = srcSr / targetSr;
+  const outLen = Math.round(mono.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcIdx = i * ratio;
+    const i0 = Math.floor(srcIdx);
+    const i1 = Math.min(i0 + 1, mono.length - 1);
+    const frac = srcIdx - i0;
+    out[i] = mono[i0] * (1 - frac) + mono[i1] * frac;
+  }
+  return out;
 }
 
 function formatDuration(seconds) {
