@@ -269,7 +269,6 @@
     display: none;
     white-space: nowrap;
     -webkit-tap-highlight-color: transparent;
-    line-height: 1;
   }
   .transcript-btn.show { display: inline-block; }
   .transcript-btn.loading {
@@ -743,7 +742,7 @@ function ensureWorker() {
         env.useBrowserCache = true;
         const t = await pipeline(
           'automatic-speech-recognition',
-          'Xenova/whisper-base.en',
+          'Xenova/whisper-small.en',
           {
             progress_callback: (p) => {
               if (p.status === 'progress' || p.status === 'download' || p.status === 'ready' || p.status === 'initiate') {
